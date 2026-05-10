@@ -1145,6 +1145,338 @@ class TestBundleBindExplicit:
         assert "Bundle Subject digest does not match" in out_flat
 
 
+class TestAuditPackageComprehensive:
+    """End-to-end CLI coverage of the comprehensive audit-envelope shape.
+
+    Covers every key the envelope can carry: ``assumptions: [...]``,
+    flat ``assertions_by_assumption`` map, per-result denormalised
+    ``control_id`` / ``assumption_id``, soft-delete markers, and
+    ``orphan_result_assertion_ids``.
+
+    Each test pins one CLI behaviour the auditor relies on. The CLI
+    is forwards- and backwards-compatible: it consumes envelopes that
+    carry these keys and falls through gracefully when they're absent."""
+
+    def _build_pkg(
+        self,
+        tmp_path,
+        *,
+        controls=None,
+        assumptions=None,
+        results=None,
+        assertions_by_control=None,
+        assertions_by_assumption=None,
+        sufficiency=None,
+        orphan_assertion_ids=None,
+    ):
+        import json
+        pkg = {
+            "model": {"id": "m1"},
+            "controls": controls or [],
+            "assumptions": assumptions or [],
+            "assertions_by_control": assertions_by_control or {},
+            "assertions_by_assumption": assertions_by_assumption or {},
+            "sufficiency": sufficiency or {},
+            "verification_run": {
+                "id": "r1",
+                "results": results or [],
+                "orphan_result_assertion_ids": orphan_assertion_ids or [],
+            },
+            "provenance": {},
+            "content_integrity": {},
+        }
+        path = tmp_path / "pkg.json"
+        path.write_text(json.dumps(pkg), encoding="utf-8")
+        return str(path)
+
+    def test_assumption_bound_assertion_renders_under_assumptions_section(self, tmp_path):
+        """An assertion bound to an assumption (not a control) renders
+        under its own ``Assumptions`` section with the assumption's
+        description and an explicit note that sufficiency doesn't apply
+        (sufficiency is a control-level concept)."""
+        pkg_path = self._build_pkg(
+            tmp_path,
+            assumptions=[{"id": "AS1", "description": "External auth provider enforces MFA",
+                          "type": "external", "status": "active", "assertions": [], "deleted": False}],
+            results=[{"assertion_id": "asrt_1", "result": "pass", "tier": 1,
+                      "control_id": "", "assumption_id": "AS1"}],
+            assertions_by_assumption={"AS1": [{"id": "asrt_1"}]},
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", pkg_path])
+        out_flat = " ".join(result.output.split())
+        assert "Assumptions" in result.output
+        assert "AS1" in out_flat
+        assert "External auth provider enforces MFA" in out_flat
+        assert "asrt_1" in out_flat
+        # Sufficiency caveat appears, no per-row sufficiency line.
+        assert "Sufficiency does not apply" in out_flat
+        # The verdict tally separates control vs assumption assertions.
+        assert "1/1 assumption assertions pass" in out_flat
+
+    def test_denormalised_control_id_drives_grouping_when_lookup_tables_empty(self, tmp_path):
+        """The per-result ``control_id`` denorm field is the primary
+        grouping signal. Even without flat lookup tables OR rich nested
+        assertion lists in the envelope, results group correctly under
+        their parent control via the denorm field alone."""
+        pkg_path = self._build_pkg(
+            tmp_path,
+            controls=[{"id": "CTRL-1", "description": "Encrypt at rest",
+                       "status": "implemented", "co_mappings": [], "sufficiency": None,
+                       "assertions": [], "deleted": False}],
+            results=[{"assertion_id": "asrt_1", "result": "pass", "tier": 1,
+                      "control_id": "CTRL-1", "assumption_id": ""}],
+            # Deliberately omit assertions_by_control to prove the
+            # denorm path is engaged, not the cross-reference fallback.
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", pkg_path])
+        out_flat = " ".join(result.output.split())
+        assert "CTRL-1" in out_flat
+        assert "Encrypt at rest" in out_flat
+        assert "Unmapped" not in out_flat
+
+    def test_legacy_envelope_without_denorm_falls_back_to_assertions_by_control(self, tmp_path):
+        """Older envelope shapes without the per-result
+        denorm fields and without ``assertions_by_assumption``. The CLI
+        must still group correctly using whatever lookup tables are
+        present, including the rich nested ``controls[].assertions``
+        list as a final fallback."""
+        pkg_path = self._build_pkg(
+            tmp_path,
+            controls=[{"id": "CTRL-1", "description": "encrypt",
+                       "status": "implemented", "co_mappings": [], "sufficiency": None,
+                       "assertions": [{"id": "asrt_1"}], "deleted": False}],
+            # No flat lookup map, no per-result denorm — only the rich list.
+            results=[{"assertion_id": "asrt_1", "result": "pass", "tier": 1}],
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", pkg_path])
+        out_flat = " ".join(result.output.split())
+        assert "CTRL-1" in out_flat
+        assert "Unmapped" not in out_flat
+
+    def test_soft_deleted_control_renders_with_retired_marker(self, tmp_path):
+        """A control retired after a verification ran still has its
+        results in the package; render them with a ``(retired)`` marker
+        instead of dropping or mis-attributing."""
+        pkg_path = self._build_pkg(
+            tmp_path,
+            controls=[{"id": "CTRL-OLD", "description": "old check",
+                       "status": "not_implemented", "co_mappings": [], "sufficiency": None,
+                       "assertions": [], "deleted": True}],
+            results=[{"assertion_id": "asrt_1", "result": "pass", "tier": 1,
+                      "control_id": "CTRL-OLD", "assumption_id": ""}],
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", pkg_path])
+        out_flat = " ".join(result.output.split())
+        assert "CTRL-OLD" in out_flat
+        assert "(retired)" in out_flat
+
+    def test_orphan_results_fail_closed_by_default(self, tmp_path):
+        """Package-integrity issue: a result floats free of any control
+        or assumption. The auditor cannot verify CONSISTENCY of the
+        package, and consistency is a precondition for any other check.
+        Default behaviour is fail-closed (same precedent as bundle
+        signature INVALID and --require-verification): exit 1, verdict
+        FAILED with a specific package-integrity message that
+        distinguishes from cryptographic-chain failure."""
+        pkg_path = self._build_pkg(
+            tmp_path,
+            results=[{"assertion_id": "asrt_ghost", "result": "pass", "tier": 1}],
+            orphan_assertion_ids=["asrt_ghost"],
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", pkg_path])
+        assert result.exit_code == 1, result.output
+        out_flat = " ".join(result.output.split())
+        assert "Unmapped results" in result.output
+        assert "asrt_ghost" in out_flat
+        assert "Backend marked 1 assertion id(s)" in out_flat
+        assert "Verdict: FAILED" in out_flat
+        assert "internally-inconsistent" in out_flat
+        # Crypto-chain status reported separately so the auditor
+        # immediately sees this is a package-shape issue, not a
+        # signature failure.
+        assert "Cryptographic chain itself is INTACT" in out_flat
+        # Override flag is surfaced in the failure message so the
+        # auditor doesn't have to re-read the docs to find it.
+        assert "--allow-orphan-results" in result.output
+
+    def test_orphan_results_override_demotes_to_partially_verified(self, tmp_path):
+        """``--allow-orphan-results`` lets an auditor who's manually
+        reviewed the orphan list downgrade the verdict from FAILED
+        (default) to PARTIALLY VERIFIED. The orphan count stays in the
+        verdict line so the inconsistency remains visible — the
+        override doesn't pretend the package is healthy."""
+        pkg_path = self._build_pkg(
+            tmp_path,
+            results=[{"assertion_id": "asrt_ghost", "result": "pass", "tier": 1}],
+            orphan_assertion_ids=["asrt_ghost"],
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", pkg_path, "--allow-orphan-results"])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "PARTIALLY VERIFIED" in out_flat
+        assert "1 orphan" in out_flat
+        assert "--allow-orphan-results override active" in out_flat
+        # The Unmapped section still renders so the auditor can see
+        # what they're allowing through.
+        assert "Unmapped results" in result.output
+
+
+class TestTrustContractSigstoreAnchored:
+    """When the row's key_source is ``sigstore``, the inline
+    content_integrity signature is intentionally skipped because the
+    Sigstore bundle is the authoritative trust anchor. The trust-contract
+    summary must report SKIPPED, not FAILED.
+
+    Regression for the case where an audit ran cleanly (bundle verified,
+    Rekor inclusion verified, bundle-bind verified) but the summary
+    contradicted the per-row output by labelling the SKIPPED state as
+    FAILED, alarming the auditor for no reason."""
+
+    def _build_sigstore_anchored_pkg(self, tmp_path, *, sufficiency=None):
+        import base64 as _b64
+        import hashlib as _h
+        import json as _j
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        platform_key = ec.generate_private_key(ec.SECP256R1())
+        bind_hex = "5e" * 32
+        bb_sig = platform_key.sign(bind_hex.encode("utf-8"), ec.ECDSA(hashes.SHA256()))
+        # The CLI canonicalises pkg["verification_run"]["results"] and
+        # checks the hash against ci["results_hash"]. Use the same
+        # canonicalisation here so the hash matches.
+        results = [{"assertion_id": "asrt_1", "result": "pass"}]
+        canonical = _j.dumps(results, sort_keys=True, separators=(",", ":"))
+        results_hash = "sha256:" + _h.sha256(canonical.encode()).hexdigest()
+        from cryptography.hazmat.primitives import serialization
+        platform_pub_pem = platform_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode()
+
+        pkg = {
+            "model": {"id": "m1"},
+            "controls": [{"id": "CTRL-1", "description": "test control"}],
+            "verification_run": {"id": "r1", "results": results},
+            "provenance": {"bundle": "{\"placeholder\": true}"},
+            "content_integrity": {
+                "results_hash": results_hash,
+                "public_key_pem": "",
+                "bundle_bind_hash": bind_hex,
+                "bundle_bind_signature": _b64.b64encode(bb_sig).decode(),
+                "key_source": "sigstore",
+                # Realistic envelopes carry an inline signature field on
+                # sigstore-anchored rows too (the platform emits one
+                # uniformly for the legacy verifier path); the new
+                # verifier branches on key_source first and intentionally
+                # ignores this field when key_source == "sigstore". The
+                # field's presence is what gates the per-row signature
+                # block; without it the SKIPPED branch isn't reached.
+                "signature": _b64.b64encode(b"unused-by-sigstore-branch").decode(),
+            },
+            "assertions_by_control": {
+                "CTRL-1": [{
+                    "id": "asrt_1",
+                    "type": "pattern_matches",
+                    "description": "test",
+                    "params": {},
+                }],
+            },
+            "sufficiency": {"CTRL-1": sufficiency} if sufficiency else {},
+        }
+        path = tmp_path / "pkg.json"
+        path.write_text(_j.dumps(pkg), encoding="utf-8")
+        statement = {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": "t", "digest": {"sha256": bind_hex}}],
+            "predicateType": "https://mipiti.io/attestations/v1/verification-run",
+            "predicate": {"model_id": "m1", "pipeline": {"commit_sha": "abc"}},
+        }
+        return str(path), statement, platform_pub_pem
+
+    def _patch_sigstore(self, statement):
+        from unittest.mock import MagicMock, patch
+        bundle_mock = MagicMock()
+        bundle_mock.signing_certificate.not_valid_before_utc = None
+        bundle_mock.signing_certificate.not_valid_after_utc = None
+        log_entry_mock = MagicMock()
+        log_entry_mock.log_index = 0
+        log_entry_mock.integrated_time = 0
+        log_entry_mock.log_id = MagicMock(key_id=b"")
+        bundle_mock.log_entry = log_entry_mock
+        verifier_mock = MagicMock()
+        import json as _j
+        verifier_mock.verify_dsse.return_value = (
+            "application/vnd.in-toto+json", _j.dumps(statement).encode()
+        )
+        bp = patch("sigstore.models.Bundle.from_json", return_value=bundle_mock)
+        vp = patch("sigstore.verify.Verifier.production", return_value=verifier_mock)
+        return bp, vp
+
+    def test_sigstore_anchored_row_summary_says_skipped_not_failed(self, tmp_path):
+        """Bug A regression: the trust contract summary mis-reported a
+        Sigstore-anchored row's intentionally-skipped content_integrity
+        signature as FAILED. This pins SKIPPED."""
+        path, statement, platform_pub_pem = self._build_sigstore_anchored_pkg(tmp_path)
+        bp, vp = self._patch_sigstore(statement)
+        # Provide platform pubkey so bundle-bind verification can succeed
+        # offline (otherwise the test depends on JWKS fetch). Using a
+        # tmp file written with the key's PEM.
+        pubkey_file = tmp_path / "platform_pub.pem"
+        pubkey_file.write_text(platform_pub_pem, encoding="utf-8")
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "audit", path,
+                "--platform-pubkey", str(pubkey_file),
+            ])
+        out = result.output
+        out_flat = " ".join(out.split())
+        # Per-row: SKIPPED with the sigstore-anchor explanation.
+        assert "Signature: SKIPPED" in out_flat
+        assert "Sigstore provenance is the trust anchor" in out_flat
+        # Trust contract summary: SKIPPED, NOT FAILED.
+        assert "Content-integrity sig: SKIPPED" in out_flat, (
+            f"Trust contract should report SKIPPED for sigstore-anchored "
+            f"rows; instead got: {out_flat}"
+        )
+        assert "Content-integrity sig: FAILED" not in out_flat, (
+            "Trust contract reported FAILED on a row that was "
+            "intentionally skipped because Sigstore was the trust anchor."
+        )
+
+    def test_pending_sufficiency_demotes_to_partially_verified(self, tmp_path):
+        """Bug B regression: a control with sufficiency=pending is not
+        sufficient (the LLM check hasn't completed); claiming flat
+        VERIFIED with '0/1 controls sufficient' overstates."""
+        path, statement, platform_pub_pem = self._build_sigstore_anchored_pkg(
+            tmp_path, sufficiency={"status": "pending", "details": ""},
+        )
+        bp, vp = self._patch_sigstore(statement)
+        pubkey_file = tmp_path / "platform_pub.pem"
+        pubkey_file.write_text(platform_pub_pem, encoding="utf-8")
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "audit", path,
+                "--platform-pubkey", str(pubkey_file),
+            ])
+        out_flat = " ".join(result.output.split())
+        assert "Verdict: PARTIALLY VERIFIED" in out_flat, (
+            f"Pending sufficiency must demote to PARTIALLY VERIFIED; "
+            f"got: {out_flat}"
+        )
+        assert "1 pending" in out_flat
+        # The summary should still surface the controls breakdown.
+        assert "0/1 controls sufficient" in out_flat
+
+
 class TestBundleBindKeyResolution:
     """Bundle-bind-signature platform-key resolution paths.
 
