@@ -1,0 +1,36 @@
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  
+permissions:
+  id-token: write    # required: mints the OIDC token used for Sigstore signing
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    environment: mipiti-verify
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: Mipiti/mipiti-verify@2c3e654ff7192d2f95369e98bd2d411090f3a41f # v0.45.2
+        with:
+          # Required
+          api-key: ${{ secrets.MIPITI_API_KEY }}
+
+          # Model selection (one of these)
+          all: true                    # Verify all models in the workspace
+          # model-id: "tm-abc123"     # Or verify a specific model
+
+          # Tier 2 semantic verification (omit for Tier 1 only)
+          tier2-provider: openai       # openai, anthropic, or ollama
+          tier2-model: gpt-4o-mini     # e.g. gpt-4o, claude-sonnet-4-5-20250514
+          tier2-api-key: ${{ secrets.OPENAI_API_KEY }}
+
+          # Optional
+          # reverify: true             # Re-verify all assertions, not just pending (default: true)
+          # dry-run: false             # Run without submitting results (default: false)
+          # concurrency: 1             # Max concurrent Tier 2 LLM calls (default: 1)
+          # project-root: "."          # Project root directory (default: ".")
+          # base-url: "https://api.mipiti.io"  # API base URL (default: https://api.mipiti.io)
+          # sigstore-tuf-url: "..."    # Private Sigstore deployment (default: public sigstore.dev)
