@@ -10,7 +10,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    environment: mipiti-verify
+    environment: mipiti_verify
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: Mipiti/mipiti-verify@2c3e654ff7192d2f95369e98bd2d411090f3a41f # v0.45.2
